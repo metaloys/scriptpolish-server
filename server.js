@@ -19,7 +19,7 @@ app.use(cors()); // Allow your React app to make requests
 app.use(express.json()); // Allow the server to read JSON
 
 // ---===================================---
-// --- V1 ENDPOINT: POLISH SCRIPT (Our only endpoint)
+// --- V1 ENDPOINT: POLISH SCRIPT
 // ---===================================---
 app.post('/polish', async (req, res) => {
   try {
@@ -29,7 +29,6 @@ app.post('/polish', async (req, res) => {
       return res.status(400).json({ error: 'No script provided' });
     }
 
-    // This dynamically builds the "lessons" for the AI
     const stylePrompt = styleExamples
       ? `
         ## 1. Target Style Examples
@@ -44,7 +43,7 @@ app.post('/polish', async (req, res) => {
         No specific style examples were provided. Use a standard, engaging, and clear YouTube video script style.
       `;
 
-    // --- The "Polishing" Prompt ---
+    // --- The "Polishing" Prompt (UPDATED) ---
     const prompt = `
       You are a highly-skilled script editor, "ScriptPolish AI". Your task is to rewrite a "Raw Script" to match a specific style, following strict rules.
 
@@ -60,6 +59,9 @@ app.post('/polish', async (req, res) => {
       - Fix all grammar and spelling.
       - Make it highly engaging for a video.
       - If style examples were provided, infuse the script with the same **tone, pacing, and personality** you just learned.
+      
+      - **(NEW RULE) CRITICAL TONE RULE:** The "Target Style Examples" are the ultimate authority. If the "Raw Script" has a different tone (e.g., it sounds boring or generic), you MUST **completely discard** that raw tone and **replace it** with the tone from the Style Examples.
+      
       - Ruthlessly remove all generic AI phrases ("In conclusion," "Moreover," "Delve into").
 
       **RULE 3: PRODUCE OUTPUT.**
@@ -88,5 +90,5 @@ app.post('/polish', async (req, res) => {
 
 // Start the server
 app.listen(port, () => {
-  console.log(`ScriptPolish AI server (V2.1 - Pure Learning) listening on http://localhost:${port}`);
+  console.log(`ScriptPolish AI server (V2.2 - Strict Tone) listening on http://localhost:${port}`);
 });
