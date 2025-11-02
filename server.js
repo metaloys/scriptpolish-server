@@ -21,41 +21,33 @@ const groq = new Groq({
 
 // --- Middleware ---
 app.use(cors());
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '10mb' })); 
 
 // ---================================---
-// --- V4 HELPER FUNCTIONS
+// --- V4 HELPER FUNCTIONS (No changes)
 // ---================================---
 
-// Helper 1: Analyze the script's topic
 async function analyzeTopicCategory(scriptText) {
   try {
     const predefinedCategories = [
       "Productivity", "Tech", "Finance", "Student Advice", 
       "Health", "Relationships", "Creator Economy", "Philosophy", "Other"
     ];
-
     const prompt = `
       You are a fast and accurate text classifier. Your only job is to assign one category to the following script.
       Choose ONLY from this list: ${predefinedCategories.join(", ")}.
       Return only the single category name, and nothing else.
-
       SCRIPT:
       ---
       ${scriptText.substring(0, 2000)}
       ---
     `;
-
     const chatCompletion = await groq.chat.completions.create({
       messages: [{ role: 'system', content: prompt }],
       model: 'llama-3.1-8b-instant',
     });
-
     const category = chatCompletion.choices[0]?.message?.content.trim() || "Other";
-    
-    if (predefinedCategories.includes(category)) {
-      return category;
-    }
+    if (predefinedCategories.includes(category)) return category;
     return "Other";
   } catch (error) {
     console.error("Error analyzing topic:", error);
@@ -64,8 +56,7 @@ async function analyzeTopicCategory(scriptText) {
 }
 
 // ---================================---
-// --- V4 ENDPOINT 1: POLISH SCRIPT
-// --- (Uses Mark's /polish-v4 logic)
+// --- V4 POLISH ENDPOINT (THE FIX)
 // ---================================---
 app.post('/polish', async (req, res) => {
   try {
@@ -75,7 +66,7 @@ app.post('/polish', async (req, res) => {
       return res.status(400).json({ error: 'Missing script or user ID' });
     }
 
-    // 1. Fetch the user's pre-analyzed voice patterns
+    // 1. Fetch the user's voice patterns
     const { data: profile, error: profileError } = await supabase
       .from('profiles')
       .select('voice_patterns')
@@ -88,11 +79,13 @@ app.post('/polish', async (req, res) => {
       });
     }
 
-    const voicePatterns = profile.voice_patterns; // This is the JSON object
+    // This is the JSON object from your database
+    const voicePatterns = profile.voice_patterns;
+    // This is the nested object with the actual rules
+    const patterns = voicePatterns.voice_patterns; 
 
-    // 2. Build the "Pattern Assembler" prompt (Mark's V4 Prompt)
-    // This is a more robust way to build the prompt string
-    const patterns = voicePatterns.voice_patterns; // Access the nested object
+    // 2. Build the "Pattern Assembler" prompt (THE FIX)
+    // We now build the prompt directly, without complex regex.
     const prompt = `
       You are a "Pattern Assembler." Your ONLY job is to rewrite a Fact Sheet using the EXACT patterns from this Voice Pattern Template.
 
@@ -146,7 +139,7 @@ app.post('/polish', async (req, res) => {
     const chatCompletion = await groq.chat.completions.create({
       messages: [ { role: 'system', content: prompt } ],
       model: 'llama-3.3-70b-versatile',
-      temperature: 0.3, // Lower temp for more mechanical, less "creative" output
+      temperature: 0.3,
     });
 
     const polishedText = chatCompletion.choices[0]?.message?.content.trim();
@@ -162,6 +155,10 @@ app.post('/polish', async (req, res) => {
       })
       .select('id')
       .single();
+      
+    if (historyError) {
+      console.error("Error saving polish history:", historyError);
+    }
 
     res.json({ 
       polishedScript: polishedText,
@@ -170,14 +167,14 @@ app.post('/polish', async (req, res) => {
 
   } catch (error) {
     console.error('Error in /polish:', error);
-    res.status(500).json({ error: 'Failed to polish script' });
+    // Send a more specific error message back to the frontend
+    res.status(500).json({ error: `Failed to polish script: ${error.message}` });
   }
 });
 
 
 // ---=======================================---
-// --- V4 ENDPOINT 2: ANALYZE VOICE
-// --- (Mark's /extract-patterns logic)
+// --- V4 ENDPOINT 2: ANALYZE VOICE (No changes)
 // ---=======================================---
 app.post('/analyze-voice', async (req, res) => {
   try {
@@ -186,12 +183,11 @@ app.post('/analyze-voice', async (req, res) => {
       return res.status(400).json({ error: 'User ID is required' });
     }
 
-    // 1. Get ALL of the user's pure, human-approved scripts
     const { data: examples, error: examplesError } = await supabase
       .from('voice_examples')
       .select('script_text')
       .eq('user_id', userId)
-      .order('created_at', { ascending: false }); // Get all of them
+      .order('created_at', { ascending: false });
 
     if (examplesError) throw examplesError;
     if (!examples || examples.length < 2) {
@@ -200,7 +196,6 @@ app.post('/analyze-voice', async (req, res) => {
 
     const scriptExamples = examples.map(e => e.script_text);
 
-    // 2. Build the "Voice Analyst" prompt (Mark's V4 Prompt)
     const extractPatternsPrompt = `
       You are a "Voice Pattern Analyst." Your job is to study these scripts and extract CONCRETE, MEASURABLE patterns that define the creator's unique voice.
 
@@ -268,24 +263,22 @@ app.post('/analyze-voice', async (req, res) => {
       }
     `;
 
-    // 3. Call Groq to extract patterns
     const chatCompletion = await groq.chat.completions.create({
       messages: [ { role: 'system', content: extractPatternsPrompt } ],
       model: 'llama-3.3-70b-versatile',
-      temperature: 0.1, // Low temp for accurate, deterministic JSON
-      response_format: { type: "json_object" }, // Force JSON output
+      temperature: 0.1,
+      response_format: { type: "json_object" },
     });
 
     const patternsText = chatCompletion.choices[0]?.message?.content.trim();
     if (!patternsText) throw new Error("AI did not return patterns");
 
-    const voicePatterns = JSON.parse(patternsText); // No need to parse from markdown
+    const voicePatterns = JSON.parse(patternsText); 
 
-    // 4. Save the new JSON to the user's profile
     const { error: updateError } = await supabase
       .from('profiles')
       .update({ 
-        voice_patterns: voicePatterns, // Save the new JSON
+        voice_patterns: voicePatterns,
         patterns_extracted_at: new Date().toISOString()
       })
       .eq('id', userId);
@@ -305,14 +298,13 @@ app.post('/analyze-voice', async (req, res) => {
 
 
 // ---=======================================---
-// --- V4 ENDPOINT 3: SAVE CORRECTION
-// --- (This is Mark's "Save & Learn" button)
+// --- V4 ENDPOINT 3: SAVE CORRECTION (No changes)
 // ---=======================================---
 app.post('/save-correction', async (req, res) => {
   try {
     const { 
       userId, 
-      historyId,
+      historyId, 
       aiPolishedScript, 
       userFinalScript 
     } = req.body;
@@ -321,14 +313,10 @@ app.post('/save-correction', async (req, res) => {
       return res.status(400).json({ error: 'Missing data for learning' });
     }
 
-    // 1. Calculate Quality Score
     const editDistance = levenshtein(aiPolishedScript, userFinalScript);
     const qualityScore = Math.min(100, Math.round((editDistance / aiPolishedScript.length) * 1000));
-    
-    // 2. Get the topic
     const topic = await analyzeTopicCategory(userFinalScript);
     
-    // 3. Save the new, human-perfected script to the examples table
     const { data: example, error: exampleError } = await supabase
       .from('voice_examples')
       .insert({
@@ -343,7 +331,6 @@ app.post('/save-correction', async (req, res) => {
 
     if (exampleError) throw exampleError;
 
-    // 4. Update the history record to link to the new example
     await supabase
       .from('polish_history')
       .update({ 
@@ -351,7 +338,7 @@ app.post('/save-correction', async (req, res) => {
         voice_example_id: example.id 
       })
       .eq('id', historyId)
-      .eq('user_id', userId);
+      .eq('user_id', userId); 
 
     res.json({ 
       message: 'Learning saved successfully', 
@@ -369,5 +356,5 @@ app.post('/save-correction', async (req, res) => {
 
 // Start the server
 app.listen(port, () => {
-  console.log(`ScriptPolish AI server (V4.0 - Pattern Engine) listening on http://localhost:${port}`);
+  console.log(`ScriptPolish AI server (V4.1 - Safe Polish) listening on http://localhost:${port}`);
 });
