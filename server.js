@@ -2,8 +2,11 @@ import express from 'express';
 import Groq from 'groq-sdk';
 import dotenv from 'dotenv';
 import cors from 'cors';
-import { supabase } from './supabaseClient.js'; // We now need the Supabase admin client
-import levenshtein from 'levenshtein-edit-distance'; // The diff library we just installed
+import { supabase } from './supabaseClient.js';
+import { createRequire } from 'module';
+
+const require = createRequire(import.meta.url);
+const levenshtein = require('levenshtein-edit-distance');
 
 // Load environment variables
 dotenv.config();
@@ -18,7 +21,6 @@ const groq = new Groq({
 
 // --- Middleware ---
 app.use(cors());
-// Increase the JSON payload limit to handle large scripts
 app.use(express.json({ limit: '10mb' })); 
 
 // ---================================---
@@ -46,45 +48,42 @@ async function analyzeTopicCategory(scriptText) {
 
     const chatCompletion = await groq.chat.completions.create({
       messages: [{ role: 'system', content: prompt }],
-      model: 'llama-3.1-8b-instant', // Use the fastest model for this simple task
+      model: 'llama-3.1-8b-instant',
     });
 
     const category = chatCompletion.choices[0]?.message?.content.trim() || "Other";
     
-    // Final check to make sure it's a valid category
     if (predefinedCategories.includes(category)) {
       return category;
     }
     return "Other";
   } catch (error) {
     console.error("Error analyzing topic:", error);
-    return "Other"; // Default to "Other" on failure
+    return "Other";
   }
 }
 
 // Helper 2: Select the 5 most relevant examples
 async function selectBestExamples(userId, topic) {
-  // This is the "Smart Curation" query
-  // It prefers examples of the same topic, then highest quality, then most recent
   const { data, error } = await supabase
     .from('voice_examples')
     .select('script_text')
     .eq('user_id', userId)
-    .order('topic_category', { ascending: topic !== 'Other' }) // Prioritize the matching topic
+    .order('topic_category', { ascending: topic !== 'Other' })
     .order('quality_score', { ascending: false })
     .order('created_at', { ascending: false })
     .limit(5);
 
   if (error) {
     console.error("Error selecting best examples:", error);
-    return []; // Return empty array on error
+    return [];
   }
   
   return data.map(row => row.script_text);
 }
 
 // ---================================---
-// --- V3 POLISH ENDPOINT (UPGRADED)
+// --- V3 POLISH ENDPOINT (V4 PROMPT)
 // ---================================---
 app.post('/polish', async (req, res) => {
   try {
@@ -93,16 +92,13 @@ app.post('/polish', async (req, res) => {
       return res.status(400).json({ error: 'Missing script or user ID' });
     }
 
-    // 1. Analyze the topic of the *new* script
     const scriptTopic = await analyzeTopicCategory(rawScript);
-
-    // 2. Select the 5 best *existing* examples for that topic
     const relevantExamples = await selectBestExamples(userId, scriptTopic);
 
     const stylePrompt = relevantExamples.length > 0
       ? `
-        ## 1. The Creator's Voice Profile (THE AUTHORITY)
-        Study these ${relevantExamples.length} "gold-standard" examples of the creator's voice. This is the *only* voice, tone, and pacing you are allowed to use.
+        ## 1. The Creator's Voice Profile (THE ONLY AUTHORITY)
+        You MUST study these ${relevantExamples.length} "gold-standard" scripts. This is the **only** voice, tone, and pacing you are allowed to use.
         **Examples:**
         ---
         ${relevantExamples.join('\n\n---\n\n')}
@@ -110,39 +106,40 @@ app.post('/polish', async (req, res) => {
       `
       : `
         ## 1. The Creator's Voice Profile
-        No style examples found for this user. Polish using a standard, engaging, and clear YouTube video script style.
+        No style examples found. Polish using a standard, engaging, and clear YouTube video script style.
       `;
 
-    // 3. Build the final prompt (same rules as before)
+    // --- V4 "Mark" Prompt ---
     const prompt = `
-      You are a master script editor. Your one and only job is to **re-write** a "Raw Script" so it sounds exactly like the "Creator's Voice Profile."
+      You are a "Voice Mimic" AI. Your job is to re-write a "Fact Sheet" in the *exact* style of the "Creator's Voice Profile."
 
       ${stylePrompt}
 
-      ## 2. The Raw Script (FACTS ONLY)
-      The "Raw Script" you will be given is a **boring, robotic list of facts**. It is provided **only** for its information, structure, and key data points.
+      ## 2. The Fact Sheet (NOT a style guide)
+      The "Raw Script" you will receive is just a list of facts. It is **NOT** a style guide. Its "friendly" or "corporate" tone is **WRONG** and must be **COMPLETELY DISCARDED**.
 
       ## 3. Your Task & Rules (MANDATORY)
-      You must **re-write the "Raw Script" from scratch**.
 
-      **CRITICAL RULE 1: DISCARD THE RAW VOICE.**
-      - You are **FORBIDDEN** from using the "Raw Script's" original intro, outro, transitions, or any of its "friendly" or "generic" phrasing.
-      - Your output must sound like it was written *by the creator* in the "Voice Profile," using *only* the *facts* from the "Raw Script."
-      
-      **CRITICAL RULE 2: PRESERVE ALL FACTS.**
-      - You **MUST** keep all facts, names, statistics, and the core structural points (e.g., "Reason 1," "Reason 2") from the "Raw Script."
-      - Do **NOT** add any new information, stories, or facts that are not in the "Raw Script."
+      **CRITICAL RULE 1: MIMIC THE VOICE, NOT THE TOPIC.**
+      - Your output MUST match the **pacing, sentence structure, word choice, and personality** of the "Creator's Voice Profile" examples.
+      - If the Profile uses "Hey friends," you use "Hey friends."
+      - If the Profile uses "Like, really small," you use that *kind* of informal language.
+      - You are **FORBIDDEN** from using generic AI filler ("Let's dive in," "In conclusion," "It's a powerful insight," "game-changer").
+
+      **CRITICAL RULE 2: PRESERVE THE FACTS.**
+      - You **MUST** keep all facts, names, statistics (like "92%"), and the core structural points (e.g., "Principle #1") from the "Fact Sheet."
+      - Do **NOT** add any new information, stories, or facts.
 
       **CRITICAL RULE 3: PRODUCE OUTPUT.**
       - Return ONLY the final, polished script.
-      - Do NOT add any preamble like "Here is the polished script:".
+      - Do NOT add any preamble.
     `;
     
-    // 4. Call Groq to polish the script
+    // --- Groq API Call ---
     const chatCompletion = await groq.chat.completions.create({
       messages: [
         { role: 'system', content: prompt },
-        { role: 'user', content: rawScript }
+        { role: 'user', content: rawScript } // This is the "Fact Sheet"
       ],
       model: 'llama-3.3-70b-versatile',
     });
@@ -150,7 +147,7 @@ app.post('/polish', async (req, res) => {
     const polishedText = chatCompletion.choices[0]?.message?.content.trim();
     if (!polishedText) throw new Error("No response from AI");
 
-    // 5. Save a record to the new `polish_history` table
+    // ... (rest of the /polish endpoint is the same)
     const { data: history, error: historyError } = await supabase
       .from('polish_history')
       .insert({
@@ -158,18 +155,16 @@ app.post('/polish', async (req, res) => {
         raw_script: rawScript,
         ai_polished_script: polishedText 
       })
-      .select('id') // Return the ID of the new history row
+      .select('id')
       .single();
 
     if (historyError) {
       console.error("Error saving polish history:", historyError);
-      // Don't block the user, just log the error
     }
 
-    // 6. Send the polish *and* the history ID back to the app
     res.json({ 
       polishedScript: polishedText,
-      historyId: history ? history.id : null // The app will need this to "save & learn"
+      historyId: history ? history.id : null 
     });
 
   } catch (error) {
@@ -180,13 +175,13 @@ app.post('/polish', async (req, res) => {
 
 
 // ---===================================---
-// --- V3 SAVE & LEARN ENDPOINT (NEW)
+// --- V3 SAVE & LEARN ENDPOINT (No changes)
 // ---===================================---
 app.post('/save-correction', async (req, res) => {
   try {
     const { 
       userId, 
-      historyId, // The ID of the polish we are correcting
+      historyId, 
       aiPolishedScript, 
       userFinalScript 
     } = req.body;
@@ -195,16 +190,10 @@ app.post('/save-correction', async (req, res) => {
       return res.status(400).json({ error: 'Missing data for learning' });
     }
 
-    // 1. Calculate Quality Score (as "Mark" designed)
     const editDistance = levenshtein(aiPolishedScript, userFinalScript);
-    // This is a simple formula: score = (percent_changed * 10).
-    // A 100% edit (max quality) = 100. A 10% edit = 10.
     const qualityScore = Math.min(100, Math.round((editDistance / aiPolishedScript.length) * 1000));
-    
-    // 2. Get the topic for the new script
     const topic = await analyzeTopicCategory(userFinalScript);
     
-    // 3. Save the *new* human-corrected script to the voice profile
     const { data: example, error: exampleError } = await supabase
       .from('voice_examples')
       .insert({
@@ -214,12 +203,11 @@ app.post('/save-correction', async (req, res) => {
         quality_score: qualityScore,
         word_count: userFinalScript.split(' ').length
       })
-      .select('id') // Return the ID of the new example
+      .select('id')
       .single();
 
     if (exampleError) throw exampleError;
 
-    // 4. Update the history record to link to the new example
     await supabase
       .from('polish_history')
       .update({ 
@@ -227,7 +215,7 @@ app.post('/save-correction', async (req, res) => {
         voice_example_id: example.id 
       })
       .eq('id', historyId)
-      .eq('user_id', userId); // RLS policy check
+      .eq('user_id', userId); 
 
     res.json({ 
       message: 'Learning saved successfully', 
@@ -245,5 +233,5 @@ app.post('/save-correction', async (req, res) => {
 
 // Start the server
 app.listen(port, () => {
-  console.log(`ScriptPolish AI server (V3.0 - Smart Curation) listening on http://localhost:${port}`);
+  console.log(`ScriptPolish AI server (V3.1 - Mimicry Engine) listening on http://localhost:${port}`);
 });
