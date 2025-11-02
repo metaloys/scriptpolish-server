@@ -24,7 +24,7 @@ app.use(cors());
 app.use(express.json({ limit: '10mb' })); 
 
 // ---================================---
-// --- V4 HELPER FUNCTIONS (No changes)
+// --- V4 HELPER FUNCTIONS
 // ---================================---
 
 async function analyzeTopicCategory(scriptText) {
@@ -55,6 +55,22 @@ async function analyzeTopicCategory(scriptText) {
   }
 }
 
+// Helper to safely get nested properties from the JSON
+// This prevents "cannot read properties of undefined"
+const safeGet = (obj, path, defaultValue = 'N/A') => {
+  const value = path.split('.').reduce((acc, key) => (acc && acc[key] !== undefined) ? acc[key] : undefined, obj);
+  return value !== undefined ? value : defaultValue;
+};
+
+// Helper to safely join arrays or provide a default
+const safeJoin = (arr, separator = ', ') => {
+  if (Array.isArray(arr) && arr.length > 0) {
+    return arr.join(separator);
+  }
+  return 'N/A'; // Provide a safe default if array is empty or null
+};
+
+
 // ---================================---
 // --- V4 POLISH ENDPOINT (THE FIX)
 // ---================================---
@@ -66,7 +82,6 @@ app.post('/polish', async (req, res) => {
       return res.status(400).json({ error: 'Missing script or user ID' });
     }
 
-    // 1. Fetch the user's voice patterns
     const { data: profile, error: profileError } = await supabase
       .from('profiles')
       .select('voice_patterns')
@@ -79,13 +94,10 @@ app.post('/polish', async (req, res) => {
       });
     }
 
-    // This is the JSON object from your database
-    const voicePatterns = profile.voice_patterns;
-    // This is the nested object with the actual rules
-    const patterns = voicePatterns.voice_patterns; 
+    const patterns = profile.voice_patterns?.voice_patterns || {}; // Access the nested object safely
 
-    // 2. Build the "Pattern Assembler" prompt (THE FIX)
-    // We now build the prompt directly, without complex regex.
+    // 2. Build the "Pattern Assembler" prompt (NOW 100% SAFE)
+    // We use our helper functions to prevent crashes
     const prompt = `
       You are a "Pattern Assembler." Your ONLY job is to rewrite a Fact Sheet using the EXACT patterns from this Voice Pattern Template.
 
@@ -102,33 +114,33 @@ app.post('/polish', async (req, res) => {
       ## YOUR TASK & RULES:
 
       **RULE 1: OPENINGS**
-      - You MUST start with one of these exact phrases: ${patterns.openings.common_phrases.join(' OR ')}
-      - Follow this structure: ${patterns.openings.structure}
+      - You MUST start with one of these exact phrases: ${safeJoin(safeGet(patterns, 'openings.common_phrases'), ' OR ')}
+      - Follow this structure: ${safeGet(patterns, 'openings.structure')}
 
       **RULE 2: TRANSITIONS**
-      - Between main points, use ONLY these: ${patterns.transitions.between_points.join(', ')}
+      - Between main points, use ONLY these: ${safeJoin(safeGet(patterns, 'transitions.between_points'))}
       - You are FORBIDDEN from using: "Firstly," "Secondly," "Moreover," "Furthermore," "In conclusion"
 
       **RULE 3: SENTENCE STRUCTURE**
-      - Average sentence length: ${patterns.sentence_structure.avg_length_words} words
-      - ${patterns.sentence_structure.uses_fragments ? 'You MUST use sentence fragments' : 'Avoid fragments'}
-      - ${patterns.sentence_structure.uses_questions ? 'You MUST include rhetorical questions' : 'Avoid questions'}
+      - Average sentence length: ${safeGet(patterns, 'sentence_structure.avg_length_words')} words
+      - ${safeGet(patterns, 'sentence_structure.uses_fragments', false) ? 'You MUST use sentence fragments' : 'Avoid fragments'}
+      - ${safeGet(patterns, 'sentence_structure.uses_questions', false) ? 'You MUST include rhetorical questions' : 'Avoid questions'}
 
       **RULE 4: EMPHASIS**
-      - Sprinkle in these interjections: ${patterns.emphasis_techniques.casual_interjections.join(', ')}
+      - Sprinkle in these interjections: ${safeJoin(safeGet(patterns, 'emphasis_techniques.casual_interjections'))}
 
       **RULE 5: VOCABULARY**
-      - Formality level: ${patterns.vocabulary.formality_level}
-      - Prefer these verbs: ${patterns.vocabulary.common_verbs.join(', ')}
-      - NEVER use: ${patterns.vocabulary.avoid_words.join(', ')}
+      - Formality level: ${safeGet(patterns, 'vocabulary.formality_level')}
+      - Prefer these verbs: ${safeJoin(safeGet(patterns, 'vocabulary.common_verbs'))}
+      - NEVER use: ${safeJoin(safeGet(patterns, 'vocabulary.avoid_words'))}
 
       **RULE 6: PACING**
-      - Paragraphs should be ~${patterns.pacing.paragraph_length_sentences} sentences.
-      - ${patterns.pacing.uses_single_sentence_paragraphs ? 'Use single-sentence paragraphs for emphasis' : ''}
+      - Paragraphs should be ~${safeGet(patterns, 'pacing.paragraph_length_sentences')} sentences.
+      - ${safeGet(patterns, 'pacing.uses_single_sentence_paragraphs', false) ? 'Use single-sentence paragraphs for emphasis' : ''}
 
       **RULE 7: PERSONALITY**
-      - Reference yourself like: ${patterns.personality_markers.self_reference.join(', ')}
-      - Address audience as: ${patterns.personality_markers.direct_address.join(', ')}
+      - Reference yourself like: ${safeJoin(safeGet(patterns, 'personality_markers.self_reference'))}
+      - Address audience as: ${safeJoin(safeGet(patterns, 'personality_markers.direct_address'))}
 
       **CRITICAL:** You are a COPY MACHINE, not a creative writer. Follow these patterns EXACTLY. Do not improvise.
 
@@ -167,7 +179,6 @@ app.post('/polish', async (req, res) => {
 
   } catch (error) {
     console.error('Error in /polish:', error);
-    // Send a more specific error message back to the frontend
     res.status(500).json({ error: `Failed to polish script: ${error.message}` });
   }
 });
@@ -349,12 +360,12 @@ app.post('/save-correction', async (req, res) => {
 
   } catch (error) {
     console.error('Error in /save-correction:', error);
-    res.status(500).json({ error: 'Failed to save correction' });
+    res.status(5.00).json({ error: 'Failed to save correction' });
   }
 });
 
 
 // Start the server
 app.listen(port, () => {
-  console.log(`ScriptPolish AI server (V4.1 - Safe Polish) listening on http://localhost:${port}`);
+  console.log(`ScriptPolish AI server (V4.2 - Defensive) listening on http://localhost:${port}`);
 });
