@@ -24,9 +24,10 @@ app.use(cors());
 app.use(express.json({ limit: '10mb' })); 
 
 // ---================================---
-// --- V4 HELPER FUNCTIONS
+// --- V3 HELPER FUNCTIONS
 // ---================================---
 
+// Helper 1: Analyze the script's topic
 async function analyzeTopicCategory(scriptText) {
   try {
     const predefinedCategories = [
@@ -55,267 +56,127 @@ async function analyzeTopicCategory(scriptText) {
   }
 }
 
-// Helper to safely get nested properties from the JSON
-// This prevents "cannot read properties of undefined"
-const safeGet = (obj, path, defaultValue = 'N/A') => {
-  const value = path.split('.').reduce((acc, key) => (acc && acc[key] !== undefined) ? acc[key] : undefined, obj);
-  return value !== undefined ? value : defaultValue;
-};
+// Helper 2: Select the 5 most relevant examples
+async function selectBestExamples(userId, topic) {
+  const { data, error } = await supabase
+    .from('voice_examples')
+    .select('script_text')
+    .eq('user_id', userId)
+    .order('topic_category', { ascending: topic !== 'Other' })
+    .order('quality_score', { ascending: false })
+    .order('created_at', { ascending: false })
+    .limit(5);
 
-// Helper to safely join arrays or provide a default
-const safeJoin = (arr, separator = ', ') => {
-  if (Array.isArray(arr) && arr.length > 0) {
-    return arr.join(separator);
+  if (error) {
+    console.error("Error selecting best examples:", error);
+    return [];
   }
-  return 'N/A'; // Provide a safe default if array is empty or null
-};
-
+  return data.map(row => row.script_text);
+}
 
 // ---================================---
-// --- V4 POLISH ENDPOINT (THE FIX)
+// --- V3 POLISH ENDPOINT (FINAL PROMPT)
 // ---================================---
 app.post('/polish', async (req, res) => {
   try {
     const { rawScript, userId } = req.body;
-    
     if (!rawScript || !userId) {
       return res.status(400).json({ error: 'Missing script or user ID' });
     }
 
-    const { data: profile, error: profileError } = await supabase
-      .from('profiles')
-      .select('voice_patterns')
-      .eq('id', userId)
-      .single();
+    // 1. Analyze the topic of the *new* script
+    const scriptTopic = await analyzeTopicCategory(rawScript);
 
-    if (profileError || !profile?.voice_patterns) {
-      return res.status(400).json({ 
-        error: "Voice pattern not found. Please run 'Analyze My Voice' on your profile page." 
-      });
-    }
+    // 2. Select the 5 best *existing* examples for that topic
+    const relevantExamples = await selectBestExamples(userId, scriptTopic);
 
-    const patterns = profile.voice_patterns?.voice_patterns || {}; // Access the nested object safely
+    const stylePrompt = relevantExamples.length > 0
+      ? `
+        ## 1. The Creator's Voice Profile (THE ONLY AUTHORITY)
+        You MUST study these ${relevantExamples.length} "gold-standard" scripts. This is the **only** voice, tone, and pacing you are allowed to use.
+        **Examples:**
+        ---
+        ${relevantExamples.join('\n\n---\n\n')}
+        ---
+      `
+      : `
+        ## 1. The Creator's Voice Profile
+        No style examples found. Polish using a standard, engaging, and clear YouTube video script style.
+      `;
 
-    // 2. Build the "Pattern Assembler" prompt (NOW 100% SAFE)
-    // We use our helper functions to prevent crashes
+    // 3. Build the final V4.1 "Strict Mimicry" prompt
     const prompt = `
-      You are a "Pattern Assembler." Your ONLY job is to rewrite a Fact Sheet using the EXACT patterns from this Voice Pattern Template.
+      You are a "Voice Mimic" AI. Your job is to re-write a "Fact Sheet" in the *exact* style of the "Creator's Voice Profile."
 
-      ## THE VOICE PATTERN TEMPLATE (YOUR RULES):
-      \`\`\`json
-      ${JSON.stringify(patterns, null, 2)}
-      \`\`\`
+      ${stylePrompt}
 
-      ## THE FACT SHEET (Content to Rewrite):
-      ---
-      ${rawScript}
-      ---
+      ## 2. The Fact Sheet (NOT a style guide)
+      The "Raw Script" you will receive is just a list of facts. It is **NOT** a style guide. Its "friendly" or "corporate" tone is **WRONG** and must be **COMPLETELY DISCARDED**.
 
-      ## YOUR TASK & RULES:
+      ## 3. Your Task & Rules (MANDATORY)
 
-      **RULE 1: OPENINGS**
-      - You MUST start with one of these exact phrases: ${safeJoin(safeGet(patterns, 'openings.common_phrases'), ' OR ')}
-      - Follow this structure: ${safeGet(patterns, 'openings.structure')}
+      **CRITICAL RULE 1: MIMIC THE VOICE, NOT THE TOPIC.**
+      - Your output MUST match the **pacing, sentence structure, word choice, and personality** of the "Creator's Voice Profile" examples.
+      - If the Profile uses "Hey friends," you use "Hey friends."
+      - If the Profile uses "Like, really small," you use that *kind* of informal language.
+      - You are **FORBIDDEN** from using generic AI filler ("Let's dive in," "In conclusion," "It's a powerful insight," "game-changer").
 
-      **RULE 2: TRANSITIONS**
-      - Between main points, use ONLY these: ${safeJoin(safeGet(patterns, 'transitions.between_points'))}
-      - You are FORBIDDEN from using: "Firstly," "Secondly," "Moreover," "Furthermore," "In conclusion"
+      **CRITICAL RULE 2: PRESERVE THE FACTS.**
+      - You **MUST** keep all facts, names, statistics (like "40%"), and the core structural points (e.g., "Principle #1") from the "Fact Sheet."
+      - Do **NOT** add any new information, stories, or facts. **This is critical. You must not copy anecdotes from the Style Examples.**
 
-      **RULE 3: SENTENCE STRUCTURE**
-      - Average sentence length: ${safeGet(patterns, 'sentence_structure.avg_length_words')} words
-      - ${safeGet(patterns, 'sentence_structure.uses_fragments', false) ? 'You MUST use sentence fragments' : 'Avoid fragments'}
-      - ${safeGet(patterns, 'sentence_structure.uses_questions', false) ? 'You MUST include rhetorical questions' : 'Avoid questions'}
-
-      **RULE 4: EMPHASIS**
-      - Sprinkle in these interjections: ${safeJoin(safeGet(patterns, 'emphasis_techniques.casual_interjections'))}
-
-      **RULE 5: VOCABULARY**
-      - Formality level: ${safeGet(patterns, 'vocabulary.formality_level')}
-      - Prefer these verbs: ${safeJoin(safeGet(patterns, 'vocabulary.common_verbs'))}
-      - NEVER use: ${safeJoin(safeGet(patterns, 'vocabulary.avoid_words'))}
-
-      **RULE 6: PACING**
-      - Paragraphs should be ~${safeGet(patterns, 'pacing.paragraph_length_sentences')} sentences.
-      - ${safeGet(patterns, 'pacing.uses_single_sentence_paragraphs', false) ? 'Use single-sentence paragraphs for emphasis' : ''}
-
-      **RULE 7: PERSONALITY**
-      - Reference yourself like: ${safeJoin(safeGet(patterns, 'personality_markers.self_reference'))}
-      - Address audience as: ${safeJoin(safeGet(patterns, 'personality_markers.direct_address'))}
-
-      **CRITICAL:** You are a COPY MACHINE, not a creative writer. Follow these patterns EXACTLY. Do not improvise.
-
-      OUTPUT: Only the polished script. No preamble.
+      **CRITICAL RULE 3: PRODUCE OUTPUT.**
+      - Return ONLY the final, polished script.
+      - Do NOT add any preamble.
     `;
     
-    // 3. Polish the script
+    // 4. Call Groq to polish the script
     const chatCompletion = await groq.chat.completions.create({
-      messages: [ { role: 'system', content: prompt } ],
+      messages: [
+        { role: 'system', content: prompt },
+        { role: 'user', content: rawScript } // This is the "Fact Sheet"
+      ],
       model: 'llama-3.3-70b-versatile',
-      temperature: 0.3,
     });
 
     const polishedText = chatCompletion.choices[0]?.message?.content.trim();
     if (!polishedText) throw new Error("No response from AI");
 
-    // 4. Save to history
+    // 5. Save a record to the new `polish_history` table
     const { data: history, error: historyError } = await supabase
       .from('polish_history')
       .insert({
         user_id: userId,
         raw_script: rawScript,
-        ai_polished_script: polishedText,
+        ai_polished_script: polishedText 
       })
       .select('id')
       .single();
-      
+
     if (historyError) {
       console.error("Error saving polish history:", historyError);
     }
 
     res.json({ 
       polishedScript: polishedText,
-      historyId: history?.id 
+      historyId: history ? history.id : null
     });
 
   } catch (error) {
-    console.error('Error in /polish:', error);
-    res.status(500).json({ error: `Failed to polish script: ${error.message}` });
+    console.error('Error from Groq (/polish):', error);
+    res.status(500).json({ error: 'Failed to polish script' });
   }
 });
 
 
-// ---=======================================---
-// --- V4 ENDPOINT 2: ANALYZE VOICE (No changes)
-// ---=======================================---
-app.post('/analyze-voice', async (req, res) => {
-  try {
-    const { userId } = req.body;
-    if (!userId) {
-      return res.status(400).json({ error: 'User ID is required' });
-    }
-
-    const { data: examples, error: examplesError } = await supabase
-      .from('voice_examples')
-      .select('script_text')
-      .eq('user_id', userId)
-      .order('created_at', { ascending: false });
-
-    if (examplesError) throw examplesError;
-    if (!examples || examples.length < 2) {
-      return res.status(400).json({ error: 'Need at least 2 saved examples to analyze a voice.' });
-    }
-
-    const scriptExamples = examples.map(e => e.script_text);
-
-    const extractPatternsPrompt = `
-      You are a "Voice Pattern Analyst." Your job is to study these scripts and extract CONCRETE, MEASURABLE patterns that define the creator's unique voice.
-
-      ## THE SCRIPTS TO ANALYZE:
-      ---
-      ${scriptExamples.join('\n\n---\n\n')}
-      ---
-
-      ## YOUR TASK:
-      Analyze these scripts and return a JSON object with the following structure. Be SPECIFIC and CONCRETE.
-
-      1. **OPENINGS:**
-         - What are the exact phrases used to start videos? (List 3-5 examples)
-         - What is the typical structure? (e.g., "greeting + topic intro + hook (stat or question)")
-         - Average length in words?
-
-      2. **TRANSITIONS:**
-         - Between main points: What words/phrases connect sections? (List 5-10)
-         - Within sections: How does the creator move between ideas?
-         - To examples: How are examples introduced?
-
-      3. **SENTENCE STRUCTURE:**
-         - Average sentence length in words?
-         - Does the creator use sentence fragments? (yes/no)
-         - Does the creator use rhetorical questions? (yes/no)
-         - What % of sentences are under 10 words?
-
-      4. **EMPHASIS TECHNIQUES:**
-         - What casual interjections does the creator use? ("Honestly,", "Look,", etc.)
-         - What intensifiers? ("really", "super", "way more")
-
-      5. **VOCABULARY:**
-         - Formality level: (academic, professional, casual_friend, or very_casual)
-         - Does the creator use academic jargon? (minimal, moderate, frequent)
-         - List 5-10 common action verbs
-         - List 5-10 words the creator NEVER uses (formal words to avoid)
-
-      6. **PACING:**
-         - Average paragraph length in sentences?
-         - Does the creator use single-sentence paragraphs? (yes/no)
-
-      7. **CONCLUSIONS:**
-         - What are the exact sign-off phrases? (List 2-5)
-         - Typical structure?
-
-      8. **PERSONALITY MARKERS:**
-         - How does the creator reference themselves? ("I", "For me", "When I was")
-         - How does the creator address the audience? ("you", "you guys", "friends")
-         - Does the creator show vulnerability or share failures? (yes/no with examples)
-
-      ## OUTPUT FORMAT:
-      Return ONLY valid JSON. No preamble. Use this exact structure:
-
-      {
-        "voice_patterns": {
-          "openings": { ... },
-          "transitions": { ... },
-          "sentence_structure": { ... },
-          "emphasis_techniques": { ... },
-          "vocabulary": { ... },
-          "pacing": { ... },
-          "conclusions": { ... },
-          "personality_markers": { ... }
-        }
-      }
-    `;
-
-    const chatCompletion = await groq.chat.completions.create({
-      messages: [ { role: 'system', content: extractPatternsPrompt } ],
-      model: 'llama-3.3-70b-versatile',
-      temperature: 0.1,
-      response_format: { type: "json_object" },
-    });
-
-    const patternsText = chatCompletion.choices[0]?.message?.content.trim();
-    if (!patternsText) throw new Error("AI did not return patterns");
-
-    const voicePatterns = JSON.parse(patternsText); 
-
-    const { error: updateError } = await supabase
-      .from('profiles')
-      .update({ 
-        voice_patterns: voicePatterns,
-        patterns_extracted_at: new Date().toISOString()
-      })
-      .eq('id', userId);
-
-    if (updateError) throw updateError;
-
-    res.json({ 
-      message: 'Voice patterns extracted successfully',
-      patterns: voicePatterns 
-    });
-
-  } catch (error) {
-    console.error('Error in /analyze-voice:', error);
-    res.status(500).json({ error: 'Failed to extract voice patterns' });
-  }
-});
-
-
-// ---=======================================---
-// --- V4 ENDPOINT 3: SAVE CORRECTION (No changes)
-// ---=======================================---
+// ---===================================---
+// --- V3 SAVE & LEARN ENDPOINT
+// ---===================================---
 app.post('/save-correction', async (req, res) => {
   try {
     const { 
       userId, 
-      historyId, 
+      historyId,
       aiPolishedScript, 
       userFinalScript 
     } = req.body;
@@ -324,10 +185,14 @@ app.post('/save-correction', async (req, res) => {
       return res.status(400).json({ error: 'Missing data for learning' });
     }
 
+    // 1. Calculate Quality Score
     const editDistance = levenshtein(aiPolishedScript, userFinalScript);
     const qualityScore = Math.min(100, Math.round((editDistance / aiPolishedScript.length) * 1000));
+    
+    // 2. Get the topic
     const topic = await analyzeTopicCategory(userFinalScript);
     
+    // 3. Save the *new* human-corrected script to the examples table
     const { data: example, error: exampleError } = await supabase
       .from('voice_examples')
       .insert({
@@ -342,6 +207,7 @@ app.post('/save-correction', async (req, res) => {
 
     if (exampleError) throw exampleError;
 
+    // 4. Update the history record to link to the new example
     await supabase
       .from('polish_history')
       .update({ 
@@ -360,12 +226,12 @@ app.post('/save-correction', async (req, res) => {
 
   } catch (error) {
     console.error('Error in /save-correction:', error);
-    res.status(5.00).json({ error: 'Failed to save correction' });
+    res.status(500).json({ error: 'Failed to save correction' });
   }
 });
 
 
 // Start the server
 app.listen(port, () => {
-  console.log(`ScriptPolish AI server (V4.2 - Defensive) listening on http://localhost:${port}`);
+  console.log(`ScriptPolish AI server (V3.1 - Smart Curation) listening on http://localhost:${port}`);
 });
