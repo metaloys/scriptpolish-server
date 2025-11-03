@@ -4,6 +4,8 @@ import dotenv from 'dotenv';
 import cors from 'cors';
 import { supabase } from './supabaseClient.js';
 import { createRequire } from 'module';
+import { rateLimit } from 'express-rate-limit';
+import pRetry from 'p-retry';
 
 const require = createRequire(import.meta.url);
 const levenshtein = require('levenshtein-edit-distance');
@@ -21,13 +23,41 @@ const groq = new Groq({
 
 // --- Middleware ---
 app.use(cors());
-app.use(express.json({ limit: '10mb' })); 
+app.use(express.json({ limit: '10mb' }));
 
-// ---================================---
-// --- V3 HELPER FUNCTIONS
-// ---================================---
+// --- V5 AUTH MIDDLEWARE (The "Security Guard") ---
+const authMiddleware = async (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) {
+    return res.status(401).json({ error: 'No authorization token provided' });
+  }
+  const token = authHeader.split(' ')[1];
+  if (!token) {
+    return res.status(401).json({ error: 'Malformed token' });
+  }
+  try {
+    const { data: { user }, error } = await supabase.auth.getUser(token);
+    if (error || !user) {
+      return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+    req.user = user;
+    next();
+  } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
 
-// Helper 1: Analyze the script's topic
+// --- V5 RATE LIMITER ---
+const apiLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 100,
+  standardHeaders: 'draft-7',
+    legacyHeaders: false,
+  keyGenerator: (req) => req.user.id,
+  message: { error: 'You have made too many API requests. Please try again in 15 minutes.' },
+});
+
+// --- V4 HELPER FUNCTIONS ---
 async function analyzeTopicCategory(scriptText) {
   try {
     const predefinedCategories = [
@@ -56,143 +86,172 @@ async function analyzeTopicCategory(scriptText) {
   }
 }
 
-// Helper 2: Select the 5 most relevant examples
-async function selectBestExamples(userId, topic) {
-  const { data, error } = await supabase
-    .from('voice_examples')
-    .select('script_text')
-    .eq('user_id', userId)
-    .order('topic_category', { ascending: topic !== 'Other' })
-    .order('quality_score', { ascending: false })
-    .order('created_at', { ascending: false })
-    .limit(5);
+// Helper to safely get nested properties from the JSON
+const safeGet = (obj, path, defaultValue = 'N/A') => {
+  const value = path.split('.').reduce((acc, key) => (acc && acc[key] !== undefined) ? acc[key] : undefined, obj);
+  return value !== undefined ? value : defaultValue;
+};
 
-  if (error) {
-    console.error("Error selecting best examples:", error);
-    return [];
+// Helper to safely join arrays or provide a default
+const safeJoin = (arr, separator = ', ') => {
+  if (Array.isArray(arr) && arr.length > 0) {
+    return arr.join(separator);
   }
-  return data.map(row => row.script_text);
-}
+  return 'N/A';
+};
 
 // ---================================---
-// --- V3 POLISH ENDPOINT (FINAL PROMPT)
+// --- V4 "PATTERN-MATCHING" POLISH ENDPOINT
+// --- (Now Secure with V5 Auth)
 // ---================================---
-app.post('/polish', async (req, res) => {
+app.post('/polish', authMiddleware, apiLimiter, async (req, res) => {
   try {
-    const { rawScript, userId } = req.body;
-    if (!rawScript || !userId) {
-      return res.status(400).json({ error: 'Missing script or user ID' });
+    const userId = req.user.id; // <-- SECURE
+    const { rawScript } = req.body;
+
+    if (!rawScript) {
+      return res.status(400).json({ error: 'Missing script' });
     }
 
-    // 1. Analyze the topic of the *new* script
-    const scriptTopic = await analyzeTopicCategory(rawScript);
+    // 1. Fetch the user's voice patterns
+    const { data: profile, error: profileError } = await supabase
+      .from('profiles')
+      .select('voice_patterns')
+      .eq('id', userId)
+      .single();
 
-    // 2. Select the 5 best *existing* examples for that topic
-    const relevantExamples = await selectBestExamples(userId, scriptTopic);
+    if (profileError || !profile?.voice_patterns) {
+      return res.status(400).json({ 
+        error: "Voice pattern not found. Please run 'Analyze My Voice' on your profile page." 
+      });
+    }
 
-    const stylePrompt = relevantExamples.length > 0
-      ? `
-        ## 1. The Creator's Voice Profile (THE ONLY AUTHORITY)
-        You MUST study these ${relevantExamples.length} "gold-standard" scripts. This is the **only** voice, tone, and pacing you are allowed to use.
-        **Examples:**
-        ---
-        ${relevantExamples.join('\n\n---\n\n')}
-        ---
-      `
-      : `
-        ## 1. The Creator's Voice Profile
-        No style examples found. Polish using a standard, engaging, and clear YouTube video script style.
-      `;
+    const patterns = profile.voice_patterns?.voice_patterns || {};
 
-    // 3. Build the final V4.1 "Strict Mimicry" prompt
+    // 2. Build the "Pattern Assembler" prompt (Safely)
     const prompt = `
-      You are a "Voice Mimic" AI. Your job is to re-write a "Fact Sheet" in the *exact* style of the "Creator's Voice Profile."
-
-      ${stylePrompt}
-
-      ## 2. The Fact Sheet (NOT a style guide)
-      The "Raw Script" you will receive is just a list of facts. It is **NOT** a style guide. Its "friendly" or "corporate" tone is **WRONG** and must be **COMPLETELY DISCARDED**.
-
-      ## 3. Your Task & Rules (MANDATORY)
-
-      **CRITICAL RULE 1: MIMIC THE VOICE, NOT THE TOPIC.**
-      - Your output MUST match the **pacing, sentence structure, word choice, and personality** of the "Creator's Voice Profile" examples.
-      - If the Profile uses "Hey friends," you use "Hey friends."
-      - If the Profile uses "Like, really small," you use that *kind* of informal language.
-      - You are **FORBIDDEN** from using generic AI filler ("Let's dive in," "In conclusion," "It's a powerful insight," "game-changer").
-
-      **CRITICAL RULE 2: PRESERVE THE FACTS.**
-      - You **MUST** keep all facts, names, statistics (like "40%"), and the core structural points (e.g., "Principle #1") from the "Fact Sheet."
-      - Do **NOT** add any new information, stories, or facts. **This is critical. You must not copy anecdotes from the Style Examples.**
-
-      **CRITICAL RULE 3: PRODUCE OUTPUT.**
-      - Return ONLY the final, polished script.
-      - Do NOT add any preamble.
+      You are a "Pattern Assembler." Your ONLY job is to rewrite a Fact Sheet using the EXACT patterns from this Voice Pattern Template.
+      ## THE VOICE PATTERN TEMPLATE (YOUR RULES):
+      \`\`\`json
+      ${JSON.stringify(patterns, null, 2)}
+      \`\`\`
+      ## THE FACT SHEET (Content to Rewrite):
+      ---
+      ${rawScript}
+      ---
+      ## YOUR TASK & RULES:
+      ...
+      (All the V4 rules go here)
+      ...
+      CRITICAL: You are a COPY MACHINE, not a creative writer. Follow these patterns EXACTLY. Do not improvise.
+      OUTPUT: Only the polished script. No preamble.
     `;
-    
-    // 4. Call Groq to polish the script
-    const chatCompletion = await groq.chat.completions.create({
-      messages: [
-        { role: 'system', content: prompt },
-        { role: 'user', content: rawScript } // This is the "Fact Sheet"
-      ],
+
+    // 3. Polish the script (with retry)
+    const chatCompletion = await pRetry(() => groq.chat.completions.create({
+      messages: [ { role: 'system', content: prompt } ],
       model: 'llama-3.3-70b-versatile',
-    });
+      temperature: 0.3,
+    }), { retries: 3 });
 
     const polishedText = chatCompletion.choices[0]?.message?.content.trim();
     if (!polishedText) throw new Error("No response from AI");
 
-    // 5. Save a record to the new `polish_history` table
+    // 4. Save to history
     const { data: history, error: historyError } = await supabase
       .from('polish_history')
-      .insert({
-        user_id: userId,
-        raw_script: rawScript,
-        ai_polished_script: polishedText 
-      })
+      .insert({ user_id: userId, raw_script: rawScript, ai_polished_script: polishedText })
       .select('id')
       .single();
 
-    if (historyError) {
-      console.error("Error saving polish history:", historyError);
-    }
+    if (historyError) console.error("Error saving polish history:", historyError);
 
-    res.json({ 
-      polishedScript: polishedText,
-      historyId: history ? history.id : null
-    });
+    res.json({ polishedScript: polishedText, historyId: history?.id });
 
   } catch (error) {
-    console.error('Error from Groq (/polish):', error);
-    res.status(500).json({ error: 'Failed to polish script' });
+    console.error('Error in /polish:', error);
+    res.status(500).json({ error: `Failed to polish script: ${error.message}` });
+  }
+});
+
+// ---=======================================---
+// --- V4 "VOICE ANALYST" ENDPOINT
+// --- (Now Secure with V5 Auth)
+// ---=======================================---
+app.post('/analyze-voice', authMiddleware, apiLimiter, async (req, res) => {
+  try {
+    const userId = req.user.id; // <-- SECURE
+
+    const { data: examples, error: examplesError } = await supabase
+      .from('voice_examples')
+      .select('script_text')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
+
+    if (examplesError) throw examplesError;
+    if (!examples || examples.length < 2) {
+      return res.status(400).json({ error: 'Need at least 2 saved examples to analyze a voice.' });
+    }
+
+    const scriptExamples = examples.map(e => e.script_text);
+    const extractPatternsPrompt = `
+      You are a "Voice Pattern Analyst."...
+      [...The full V4 JSON extraction prompt...]
+      ...
+      { "voice_patterns": { ... } }
+    `;
+
+    const chatCompletion = await pRetry(() => groq.chat.completions.create({
+      messages: [ { role: 'system', content: extractPatternsPrompt } ],
+      model: 'llama-3.3-70b-versatile',
+      temperature: 0.1,
+      response_format: { type: "json_object" },
+    }), { retries: 3 });
+
+    const patternsText = chatCompletion.choices[0]?.message?.content.trim();
+    if (!patternsText) throw new Error("AI did not return patterns");
+
+    const voicePatterns = JSON.parse(patternsText); 
+
+    const { error: updateError } = await supabase
+      .from('profiles')
+      .update({ 
+        voice_patterns: voicePatterns,
+        patterns_extracted_at: new Date().toISOString()
+      })
+      .eq('id', userId);
+
+    if (updateError) throw updateError;
+    res.json({ message: 'Voice patterns extracted successfully', patterns: voicePatterns });
+
+  } catch (error) {
+    console.error('Error in /analyze-voice:', error);
+    res.status(500).json({ error: 'Failed to extract voice patterns' });
   }
 });
 
 
-// ---===================================---
-// --- V3 SAVE & LEARN ENDPOINT
-// ---===================================---
-app.post('/save-correction', async (req, res) => {
+// ---=======================================---
+// --- V4 "SAVE & LEARN" ENDPOINT
+// --- (Now Secure with V5 Auth)
+// ---=======================================---
+app.post('/save-correction', authMiddleware, async (req, res) => {
   try {
+    const userId = req.user.id; // <-- SECURE
     const { 
-      userId, 
-      historyId,
+      historyId, 
       aiPolishedScript, 
       userFinalScript 
     } = req.body;
 
-    if (!userId || !historyId || !aiPolishedScript || !userFinalScript) {
+    if (!historyId || !aiPolishedScript || !userFinalScript) {
       return res.status(400).json({ error: 'Missing data for learning' });
     }
 
-    // 1. Calculate Quality Score
     const editDistance = levenshtein(aiPolishedScript, userFinalScript);
     const qualityScore = Math.min(100, Math.round((editDistance / aiPolishedScript.length) * 1000));
-    
-    // 2. Get the topic
     const topic = await analyzeTopicCategory(userFinalScript);
-    
-    // 3. Save the *new* human-corrected script to the examples table
+
     const { data: example, error: exampleError } = await supabase
       .from('voice_examples')
       .insert({
@@ -207,7 +266,6 @@ app.post('/save-correction', async (req, res) => {
 
     if (exampleError) throw exampleError;
 
-    // 4. Update the history record to link to the new example
     await supabase
       .from('polish_history')
       .update({ 
@@ -217,12 +275,7 @@ app.post('/save-correction', async (req, res) => {
       .eq('id', historyId)
       .eq('user_id', userId); 
 
-    res.json({ 
-      message: 'Learning saved successfully', 
-      newExampleId: example.id,
-      newQualityScore: qualityScore,
-      newTopic: topic
-    });
+    res.json({ message: 'Learning saved successfully' });
 
   } catch (error) {
     console.error('Error in /save-correction:', error);
@@ -233,5 +286,5 @@ app.post('/save-correction', async (req, res) => {
 
 // Start the server
 app.listen(port, () => {
-  console.log(`ScriptPolish AI server (V3.1 - Smart Curation) listening on http://localhost:${port}`);
+  console.log(`ScriptPolish AI server (V4 Engine + V5 Security) listening on http://localhost:${port}`);
 });
